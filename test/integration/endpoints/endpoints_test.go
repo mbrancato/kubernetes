@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +37,7 @@ import (
 	"k8s.io/kubernetes/pkg/controller/endpoint"
 	"k8s.io/kubernetes/test/integration/framework"
 	"k8s.io/kubernetes/test/utils/ktesting"
+	netutils "k8s.io/utils/net"
 )
 
 func TestEndpointUpdates(t *testing.T) {
@@ -576,6 +579,264 @@ func TestEndpointWithTerminatingPod(t *testing.T) {
 	}
 }
 
+func TestEndpointWithLargeRapidChanges(t *testing.T) {
+	// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer server.TearDownFn()
+	client, err := clientset.NewForConfig(server.ClientConfig)
+	if err != nil {
+		t.Fatalf("Error creating clientset: %v", err)
+	}
+
+	informers := informers.NewSharedInformerFactory(client, 0)
+	tCtx := ktesting.Init(t)
+	endpointController := endpoint.NewEndpointController(
+		tCtx,
+		informers.Core().V1().Pods(),
+		informers.Core().V1().Services(),
+		informers.Core().V1().Endpoints(),
+		client,
+		0)
+
+	// Start informer and controllers
+	informers.Start(tCtx.Done())
+	go endpointController.Run(tCtx, 1)
+
+	// Create namespace
+	ns := framework.CreateNamespaceOrDie(client, "test-endpoints-large-rapid-changes", t)
+	defer framework.DeleteNamespaceOrDie(client, ns, t)
+
+	// Create a pod with labels
+	basePod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "test-pod",
+			Labels: labelMap(),
+		},
+		Spec: v1.PodSpec{
+			NodeName: "fake-node",
+			Containers: []v1.Container{
+				{
+					Name:  "fakename",
+					Image: "fakeimage",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          "port-443",
+							ContainerPort: 443,
+						},
+					},
+				},
+			},
+		},
+		Status: v1.PodStatus{
+			Phase: v1.PodRunning,
+			Conditions: []v1.PodCondition{
+				{
+					Type:   v1.PodReady,
+					Status: v1.ConditionTrue,
+				},
+			},
+			PodIP: "10.0.0.1",
+			PodIPs: []v1.PodIP{
+				{
+					IP: "10.0.0.1",
+				},
+			},
+		},
+	}
+	// create 1001 Pods to reach endpoint max capacity that is set to 1000
+	baseIP := netutils.BigForIP(netutils.ParseIPSloppy("10.0.0.1"))
+
+	// Endpoints truncate max capacity is not exported from
+	// pkg/controller/endpoint/endpoints_controller.go so hardcoding to 1000
+	maxPodCount := 1000
+	currentPods := make([]string, 0)
+	for i := 0; i < maxPodCount; i++ {
+		pod := basePod.DeepCopy()
+		pod.Name = fmt.Sprintf("%s-%s", basePod.Name, randString(8))
+		currentPods = append(currentPods, pod.Name)
+		podIP := netutils.AddIPOffset(baseIP, i).String()
+		pod.Status.PodIP = podIP
+		pod.Status.PodIPs[0] = v1.PodIP{IP: podIP}
+
+		createdPod, podErr := client.CoreV1().Pods(ns.Name).Create(tCtx, pod, metav1.CreateOptions{})
+		if podErr != nil {
+			t.Logf("error creating pod: %v", podErr)
+			return
+		}
+		createdPod.Status = pod.Status
+		_, _ = client.CoreV1().Pods(ns.Name).UpdateStatus(tCtx, createdPod, metav1.UpdateOptions{})
+
+		if i%100 == 0 {
+			t.Logf("Created %d pods", i)
+		}
+	}
+
+	t.Logf("Waiting for initial pods to stabilize")
+	// poll until endpoints for deleted Pod are no longer in Endpoints.
+	if err := wait.PollImmediate(time.Second, 10*time.Second, func() (bool, error) {
+		pods, err := client.CoreV1().Pods(ns.Name).List(tCtx, metav1.ListOptions{})
+		if err != nil {
+			return false, nil
+		}
+		if len(pods.Items) != len(currentPods) {
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("error checking for pods: %v", err)
+	}
+
+	// Create a service associated to the pods
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-service",
+			Namespace: ns.Name,
+			Labels: map[string]string{
+				"foo": "bar",
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Selector: map[string]string{
+				"foo": "bar",
+			},
+			Ports: []v1.ServicePort{
+				{Name: "port-443", Port: 443, Protocol: "TCP", TargetPort: intstr.FromInt32(443)},
+				{Name: "port-8443", Port: 8443, Protocol: "TCP", TargetPort: intstr.FromInt32(8443)},
+				{Name: "port-9090", Port: 9090, Protocol: "TCP", TargetPort: intstr.FromInt32(9090)},
+				{Name: "port-9443", Port: 9443, Protocol: "TCP", TargetPort: intstr.FromInt32(9443)},
+			},
+		},
+	}
+
+	_, err = client.CoreV1().Services(ns.Name).Create(tCtx, svc, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create service %s: %v", svc.Name, err)
+	}
+
+	// Poll until associated Endpoints to the previously created Service exists
+	if err := wait.PollImmediate(1*time.Second, 10*time.Second, func() (bool, error) {
+		endpoints, err := client.CoreV1().Endpoints(ns.Name).Get(tCtx, svc.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		numEndpoints := 0
+		for _, subset := range endpoints.Subsets {
+			numEndpoints += len(subset.Addresses)
+		}
+		if numEndpoints != maxPodCount {
+			return false, nil
+		}
+		truncated, ok := endpoints.Annotations[v1.EndpointsOverCapacity]
+		if ok || truncated == "truncated" {
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("endpoints not found: %v", err)
+	}
+
+	// Perform 15 rapid rounds of asynchronous add / delete operations
+	add := true
+	for i := 0; i < 15; i++ {
+		if add {
+			limit := (maxPodCount / 50) + rand.Intn(maxPodCount/50)
+			if limit < 10 {
+				limit = 10
+			}
+			t.Logf("Adding %d pods", limit)
+			for j := 0; j < limit; j++ {
+				pod := basePod.DeepCopy()
+				pod.Name = fmt.Sprintf("%s-%s", basePod.Name, randString(8))
+				currentPods = append(currentPods, pod.Name)
+				podIP := netutils.AddIPOffset(baseIP, maxPodCount+i).String()
+				pod.Status.PodIP = podIP
+				pod.Status.PodIPs[0] = v1.PodIP{IP: podIP}
+
+				go func(newPod *v1.Pod) {
+					createdPod, _ := client.CoreV1().Pods(ns.Name).Create(tCtx, newPod, metav1.CreateOptions{})
+					createdPod.Status = pod.Status
+					_, _ = client.CoreV1().Pods(ns.Name).UpdateStatus(tCtx, createdPod, metav1.UpdateOptions{})
+				}(pod)
+			}
+		} else {
+			limit := rand.Intn(maxPodCount / 50)
+			if limit < 5 {
+				limit = 5
+			}
+			t.Logf("Deleting %d pods", limit)
+			for j := 0; j < limit; j++ {
+				podName := currentPods[rand.Intn(len(currentPods))]
+
+				go func(deletePodName string) {
+					_ = client.CoreV1().Pods(ns.Name).Delete(tCtx, deletePodName, metav1.DeleteOptions{})
+				}(podName)
+
+				for index, v := range currentPods {
+					if v == podName {
+						currentPods = append(currentPods[:index], currentPods[index+1:]...)
+					}
+				}
+			}
+		}
+		add = !add
+		delay := 500*time.Millisecond + time.Duration(rand.Intn(2500))*time.Millisecond
+		time.Sleep(delay)
+	}
+
+	// Slower, synchronous deletes to get the number of pods down to half the maxPodCount
+	for {
+		limit := rand.Intn(maxPodCount / 50)
+		if limit < 10 {
+			limit = 10
+		}
+		t.Logf("Deleting %d pods", limit)
+		for j := 0; j < limit; j++ {
+			podName := currentPods[rand.Intn(len(currentPods))]
+
+			podErr := client.CoreV1().Pods(ns.Name).Delete(tCtx, podName, metav1.DeleteOptions{})
+			t.Logf("Deleted pod %s", podName)
+			if podErr != nil {
+				t.Errorf("error deleting pod: %v", podErr)
+			}
+
+			for index, v := range currentPods {
+				if v == podName {
+					currentPods = append(currentPods[:index], currentPods[index+1:]...)
+				}
+			}
+		}
+		if len(currentPods) < maxPodCount/2 {
+			break
+		}
+		delay := 500*time.Millisecond + time.Duration(rand.Intn(2500))*time.Millisecond
+		time.Sleep(delay)
+	}
+
+	t.Logf("Waiting for endpoints to stabilize at final count")
+	// poll until endpoints for deleted Pods are no longer in Endpoints.
+	if err := wait.PollImmediate(time.Second, 10*time.Second, func() (bool, error) {
+		endpoints, err := client.CoreV1().Endpoints(ns.Name).Get(tCtx, svc.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		numEndpoints := 0
+		for _, subset := range endpoints.Subsets {
+			numEndpoints += len(subset.Addresses)
+		}
+		if numEndpoints != len(currentPods) {
+			t.Logf("expected %d endpoints, got %d", len(currentPods), numEndpoints)
+			return false, nil
+		}
+		truncated, ok := endpoints.Annotations[v1.EndpointsOverCapacity]
+		if ok || truncated == "truncated" {
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("error checking for correct endpoints count: %v", err)
+	}
+}
+
 func labelMap() map[string]string {
 	return map[string]string{"foo": "bar"}
 }
@@ -604,4 +865,13 @@ func newExternalNameService(namespace, name string) *v1.Service {
 	svc.Spec.Type = v1.ServiceTypeExternalName
 	svc.Spec.ExternalName = "google.com"
 	return svc
+}
+
+func randString(n int) string {
+	const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letterBytes[rand.Intn(len(letterBytes))]
+	}
+	return strings.ToLower(string(b))
 }
